@@ -1,0 +1,66 @@
+# 流程定义：节点顺序、跳转条件、并行分支、失败策略。
+#
+# next 里的 when 由 workflow/expr.py 的受限求值器执行，
+# 只允许比较、布尔运算、四则运算、下标访问和白名单内置函数（len / sum / max …），
+# 不支持任意 Python 代码 —— 这是为了替换初版里直接用 eval() 的做法。
+#
+# 字段说明：
+#   parallel —— 该节点是并行容器，列出的分支同时执行，结果再合并
+#   merge    —— 并行结束后调用的合并函数，用来重算跨分支的派生字段
+#   retries  —— 节点抛异常后的额外重试次数
+#   on_error —— 重试仍失败时的处置：abort（中断）/ skip（跳过）/ {goto: 节点id}
+
+start: code
+
+nodes:
+  - id: code
+    agent: coder
+    next: analyze
+    retries: 1
+    on_error: abort
+
+  # 并行节点：LLM 审查与本地规范检查同时跑，两边的问题合并后再判定
+  - id: analyze
+    parallel: [review, lint]
+    merge: merge_issues
+    retries: 0
+    on_error: abort
+    next:
+      # 还有 Critical / Major 级别问题，且没超过轮次上限 → 回炉修复
+      - when: "not passed and round < 3"
+        goto: fix
+      # 审查这关过了 → 去跑单元测试
+      - goto: test
+
+  - id: review
+    agent: reviewer
+    retries: 1
+    on_error: abort
+
+  # 本地规范检查不调用 LLM，即使它挂了也不该拖垮整条流程
+  - id: lint
+    agent: linter
+    retries: 0
+    on_error: skip
+
+  # 单元测试：审查判断的是"代码写得对不对"（读代码），
+  # 测试验证的是"代码跑起来对不对"（真执行），两件事不能互相替代。
+  # 用 get() 而不是直接写 tests_passed：本节点一旦被 skip，
+  # 这个字段根本不会被写入 —— 直接引用会报"状态里没有该字段"。
+  - id: test
+    agent: tester
+    retries: 1
+    on_error: skip
+    next:
+      # 只有"测试真的跑起来了并且失败了"才回炉。
+      # test_script_broken 表示测试脚本自己写错了（比如 import 了不存在的模块），
+      # 那是测试环节的失误，不能拿它当"代码没通过"的证据让代码白修三轮。
+      - when: "not get('tests_passed', False) and not get('test_script_broken', True) and round < 3"
+        goto: fix
+      - goto: done
+
+  - id: fix
+    agent: fixer
+    next: analyze
+    retries: 1
+    on_error: abort
